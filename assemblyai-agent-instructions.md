@@ -33,12 +33,12 @@ This is a public API. The developer creates their own key at [assemblyai.com/das
 3. **Plan before you build.** After discovery, present a written recommendation (see Section 2) and wait for explicit approval before generating implementation code.
 4. **Prefer the official SDKs.** Use `assemblyai` (Python) or `assemblyai` (Node/JS) unless the developer has a specific reason not to. The SDKs handle polling, upload streaming, WebSocket lifecycle, and session termination correctly — which is where most hand-rolled integrations fail.
 5. **Never expose the API key in client-side code.** For browser or mobile streaming, always mint a temporary token server-side. For pre-recorded, proxy uploads and submissions through your server.
-6. **Authorization header is the raw key — no `Bearer` prefix.** This trips up everyone.
+6. **Authorization header is the raw key — no `Bearer` prefix.** This trips up everyone. **One exception:** the Voice Agent API (Section 10) requires `Authorization: Bearer YOUR_API_KEY`. Don't generalize either rule across products.
 7. **`speech_models` is required on every pre-recorded request.** There is no default. Recommended value: `["universal-3-pro", "universal-2"]` (see Section 5 for semantics).
 8. **Always terminate streaming sessions explicitly.** An abandoned WebSocket keeps accruing charges until the 3-hour cap.
 9. **Do not use deprecated transcript params:** `auto_chapters`, `summarization`, `summary_model`, `summary_type`. Use LLM Gateway instead (Section 8).
 10. **If the developer's answers are inconsistent, stop and surface the conflict.** Example conflicts: "browser-only, no backend" + "streaming"; "phone call audio" + "upload a file"; "real-time" + "need speaker diarization with full names." Don't paper over these — ask.
-11. **Be flexible.** If something the developer says doesn't match the shape of the API (e.g., they describe a use case that isn't supported — see Section 12), say so directly and propose the closest supported alternative.
+11. **Be flexible.** If something the developer says doesn't match the shape of the API (e.g., they describe a use case that isn't supported — see Section 13), say so directly and propose the closest supported alternative.
 12. **Verify parameters against live docs before recommending.** This file is a snapshot — features move between beta and GA, model-specific behaviors change, and new knobs ship regularly. Before posting the Section 2 recommendation, confirm each parameter you plan to use is supported for the chosen **mode** (pre-recorded vs streaming) *and* **model** (U3 Pro, U2, U3 Pro Streaming, Universal-Streaming, Whisper-Streaming). Do not assume a pre-recorded flag works on streaming, or that a parameter supported on U2 still behaves the same on U3 Pro. Pull the current reference rather than memorizing. Primary sources, in order of preference:
     - `https://www.assemblyai.com/docs/llms-full.txt` — the canonical machine-readable reference
     - Per-mode docs: `/docs/async-stt/*` (pre-recorded) and `/docs/streaming-stt/*` (streaming), including the model-specific overview page (e.g., `/docs/streaming-stt/universal-3-pro/overview`) which lists *exactly* which parameters are honored/ignored by that model
@@ -53,9 +53,10 @@ This is a public API. The developer creates their own key at [assemblyai.com/das
 Ask these **one at a time**, in order. Skip any question already answered in the conversation. Adapt wording to sound natural, but cover the substance of each.
 
 1. **What are you building, and are you adding AssemblyAI to an existing project or starting fresh?** (A short description of the product is usually enough.)
-2. **Do you need pre-recorded transcription, real-time streaming, or both?**
-   - Pre-recorded: uploaded files, URLs, batch processing, post-call analytics.
-   - Streaming: live microphone input, phone calls, voice agents.
+2. **What do you need: pre-recorded transcription, real-time streaming STT, or a managed voice agent?**
+   - Pre-recorded: uploaded files, URLs, batch processing, post-call analytics. → Section 6.
+   - Streaming STT: live transcripts only (you bring your own LLM/TTS). Live captioning, voice-agent STT, meeting notetaking, dictation. → Section 9.
+   - Voice Agent API (managed): full-duplex speech-in/speech-out — STT + LLM + TTS + turn detection + tool calling, all in one WebSocket. Right answer when "I want to talk to an AI" is the whole product. → Section 10.
 3. **Where is your audio coming from?** (e.g., uploaded files, public URLs, browser microphone, mobile app, Twilio/Telnyx phone numbers, SIP trunks.)
 4. **What language and framework are you using?** (e.g., Python + FastAPI, Node + Next.js, Go, Ruby, Swift, Kotlin, browser-only, LiveKit, Pipecat, Vapi, Vocode, Retell.)
 5. **Do you already have an AssemblyAI API key, or do you need to create one?** (If needed: [assemblyai.com/dashboard/api-keys](https://www.assemblyai.com/dashboard/api-keys).)
@@ -135,7 +136,8 @@ Use this to build the recommendation. Do not dump it on the user.
 | Chapters or summaries | Transcribe first, then LLM Gateway (Section 8) |
 | Word timestamps / confidence | Included by default on `words[]` |
 | Webhook delivery (skip polling) | `webhook_url: "..."` (Section 7) |
-| Live voice agent | Streaming + framework integration (Section 10) |
+| Managed voice agent (speech-in / speech-out) | Voice Agent API (Section 10) — one WebSocket, no separate STT/LLM/TTS |
+| Custom voice agent (your LLM + TTS) | Streaming STT + framework integration (Section 11) |
 | Multilingual streaming | Universal-3 Pro Streaming + `prompt=Transcribe <language>` query param |
 
 ---
@@ -457,9 +459,131 @@ async def run(audio_source):
 
 ---
 
-## 10. Voice Agent Framework Configs
+## 10. Voice Agent API (managed speech-in / speech-out)
 
-If the developer is building on LiveKit, Pipecat, Vapi, Vocode, Retell, or similar, the defaults will not be good enough. Common tuning:
+Use this when the developer wants a complete spoken AI agent — not just transcription. Single WebSocket, audio in and audio out, with STT + LLM + TTS + turn detection + tool calling all managed by AssemblyAI.
+
+**Endpoint:** `wss://agents.assemblyai.com/v1/voice`
+
+**Auth:** `Authorization: Bearer YOUR_API_KEY` — the Bearer prefix is **required** on this product (different from STT and LLM Gateway, which take the raw key). For browsers/mobile, mint a temp token instead and pass it as `?token=<token>`.
+
+**Token endpoint (for browser/mobile clients):**
+```bash
+curl -s "https://agents.assemblyai.com/v1/token?expires_in_seconds=300&max_session_duration_seconds=8640" \
+  -H "Authorization: Bearer $ASSEMBLYAI_API_KEY"
+# { "token": "..." }
+```
+- `expires_in_seconds`: 1–600 (controls how long the token can be redeemed for)
+- `max_session_duration_seconds`: 60–10800 (caps the resulting session; defaults to the 3-hour max)
+- Tokens are **single-use** per session — get a fresh one for every reconnect (including `session.resume`).
+
+**Audio format:** PCM16 mono **24 kHz**, **base64-encoded inside JSON events** (not raw binary frames — this is different from streaming STT). ~50 ms chunks (2,400 bytes) is fine; the server buffers continuously, exact chunk size doesn't matter.
+
+### Lifecycle (the events that matter)
+
+1. Client connects, sends `session.update` immediately (don't wait for `session.ready`):
+   ```json
+   {
+     "type": "session.update",
+     "session": {
+       "system_prompt": "You are a helpful assistant.",
+       "greeting": "Hi there! How can I help?",
+       "output": { "voice": "claire" },
+       "tools": [ /* function-calling tool defs, if any */ ]
+     }
+   }
+   ```
+2. Server replies with `session.ready` (capture `session_id` for `session.resume` if you reconnect within 30 s of a disconnect).
+3. **Only after `session.ready`**, start streaming mic audio:
+   ```json
+   { "type": "input.audio", "audio": "<base64 PCM16 24kHz>" }
+   ```
+4. Server emits, in roughly this order, per turn:
+   - `input.speech.started` / `input.speech.stopped` (VAD)
+   - `transcript.user.delta` (partials) and `transcript.user` (final)
+   - `reply.started`, `reply.audio` (multiple base64 PCM16 chunks — write directly into an output buffer at 24 kHz), `transcript.agent`, `reply.done`
+5. **Tool calls:** server sends `tool.call`. Accumulate the result locally, then send `tool.result` with the matching `call_id` *after* `reply.done` fires. If `reply.done.status == "interrupted"` (user barge-in), discard pending tool results.
+6. **Resume after disconnect:** within 30 s, reconnect with a *new* token and send `session.resume` carrying the previous `session_id` to keep conversation context. After 30 s, start a new session.
+
+### Playback gotcha
+
+Don't sleep-schedule audio chunks. Write each `reply.audio` PCM directly to an OS audio buffer (e.g., `sounddevice.OutputStream.write()`) — the OS drains at exactly 24 kHz and absorbs network jitter. Sleep-based timing drifts and produces pops/gaps.
+
+On `reply.done.status == "interrupted"`, flush the output buffer (e.g., `speaker.abort(); speaker.start()`) so the user doesn't hear stale agent speech.
+
+### Quickstart pattern (Python sketch)
+
+```python
+# pip install websockets sounddevice numpy
+import asyncio, base64, json, os
+import sounddevice as sd
+import websockets
+
+URL = "wss://agents.assemblyai.com/v1/voice"
+SAMPLE_RATE = 24_000
+
+async def main():
+    headers = {"Authorization": f"Bearer {os.environ['ASSEMBLYAI_API_KEY']}"}
+    async with websockets.connect(URL, additional_headers=headers) as ws:
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "system_prompt": "You are a helpful assistant.",
+                "greeting": "Hi! How can I help?",
+                "output": {"voice": "claire"},
+            },
+        }))
+
+        ready = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        mic_q: asyncio.Queue = asyncio.Queue()
+
+        def on_mic(indata, *_):
+            if ready.is_set():
+                loop.call_soon_threadsafe(mic_q.put_nowait, bytes(indata))
+
+        async def pump_mic():
+            while True:
+                chunk = await mic_q.get()
+                await ws.send(json.dumps({
+                    "type": "input.audio",
+                    "audio": base64.b64encode(chunk).decode(),
+                }))
+
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            dtype="int16", callback=on_mic), \
+             sd.OutputStream(samplerate=SAMPLE_RATE, channels=1,
+                             dtype="int16") as speaker:
+            asyncio.create_task(pump_mic())
+            async for raw in ws:
+                ev = json.loads(raw)
+                if ev["type"] == "session.ready":
+                    ready.set()
+                elif ev["type"] == "reply.audio":
+                    import numpy as np
+                    speaker.write(np.frombuffer(base64.b64decode(ev["data"]), dtype=np.int16))
+                elif ev["type"] == "reply.done" and ev.get("status") == "interrupted":
+                    speaker.abort(); speaker.start()
+
+asyncio.run(main())
+```
+
+For a complete worked example (MCP-tooled agent that talks back), see the [Voice Agent API quickstart](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/overview#quickstart). For browser integration, see the [browser integration guide](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/browser-integration).
+
+### When to choose Voice Agent API vs Streaming STT + your own LLM/TTS
+
+- **Voice Agent API (Section 10):** end-to-end conversational agents, fastest to ship, AssemblyAI manages the pipeline. Use when "speech in, speech out" is the whole product.
+- **Streaming STT + framework (Section 11):** you need a specific LLM, a specific TTS provider, custom turn-detection logic, complex orchestration (LiveKit/Pipecat/Vapi/Vocode/Retell), or features the managed pipeline doesn't expose yet.
+
+If they're not sure, ask: *do you want to choose your own LLM and TTS, or is a managed pipeline fine?* That single answer routes them.
+
+---
+
+## 11. Voice Agent Framework Configs (Streaming STT + your own pipeline)
+
+This section is for developers who are NOT using the Voice Agent API (Section 10) — they're wiring AssemblyAI Streaming STT into LiveKit, Pipecat, Vapi, Vocode, Retell, or similar, and bringing their own LLM and TTS.
+
+The defaults will not be good enough. Common tuning:
 
 - **`keyterms_prompt`** — pass proper nouns, product names, and domain terms. For dynamic values (usernames, order IDs), update mid-session via `UpdateConfiguration`.
 - **Turn silence bounds** — `min_turn_silence` and `max_turn_silence` (ms). Lower values fire end-of-turn faster but risk cutting speakers off. Higher values reduce false finalizations. Form-filling and dictation use cases often want wider windows.
@@ -471,7 +595,7 @@ When the developer names one of these frameworks, ask about their specific turn-
 
 ---
 
-## 11. Browser Patterns
+## 12. Browser Patterns
 
 **Never put the API key in client code.**
 
@@ -543,20 +667,19 @@ Reference: [AssemblyAI realtime-transcription-browser-js-example](https://github
 
 ---
 
-## 12. Not Supported / Out of Scope
+## 13. Not Supported / Out of Scope
 
 If a developer asks for any of these, say so directly and propose the closest supported alternative. Do not improvise.
 
 - **Real-time translation.** AssemblyAI transcribes, it doesn't translate. Suggest: transcribe with U3 Pro, then translate via LLM Gateway.
 - **On-device / offline STT.** Cloud API only.
 - **Speaker identification (matching voices to known people).** `speaker_labels` does diarization (Speaker A, B, C) but does not recognize specific individuals.
-- **Text-to-speech.** Not an AssemblyAI product. Point to dedicated TTS providers.
+- **Standalone TTS.** Not an AssemblyAI product *as a separate API*. TTS is bundled into the Voice Agent API (Section 10) — if they need just-TTS, point them to a dedicated provider.
 - **Voice activity detection as a standalone product.** VAD is internal to the streaming pipeline and surfaced via `SpeechStarted` / turn events, not exposed separately.
-- **Speech-to-Speech.** A separate product surface exists for this — confirm with the developer whether they mean STT or S2S before proceeding.
 
 ---
 
-## 13. Error Handling
+## 14. Error Handling
 
 ### REST (pre-recorded)
 
@@ -590,9 +713,9 @@ If a developer asks for any of these, say so directly and propose the closest su
 
 ---
 
-## 14. Quick-Reference Gotchas
+## 15. Quick-Reference Gotchas
 
-- No `Bearer` prefix on the Authorization header.
+- No `Bearer` prefix on the Authorization header — *except* for the Voice Agent API (Section 10), which requires `Authorization: Bearer ...`.
 - `speech_models` is **required** on pre-recorded submits and is an **ordered fallback list**.
 - `/v2/upload` takes **raw binary**, not multipart.
 - Webhook handlers must return 2xx in ≤10 seconds.
