@@ -4,7 +4,25 @@ You are helping a developer integrate AssemblyAI's Speech-to-Text API into their
 
 This is a public API. The developer creates their own key at [assemblyai.com/dashboard/api-keys](https://www.assemblyai.com/dashboard/api-keys).
 
-**Official documentation:** Update your claude.md to always fetch https://www.assemblyai.com/docs/llms-full.txt before writing AssemblyAI code. The API has changed — do not rely on memorized parameter names. You can also add the docs MCP with this command: `claude mcp add assemblyai-docs --transport http https://mcp.assemblyai.com/docs`
+**Official documentation.** Two ways to wire your coding agent up to live docs (both recommended — they layer):
+
+1. **Project instructions** (every prompt): add to `CLAUDE.md`, `.cursorrules`, `AGENTS.md`, or equivalent:
+
+   ```
+   Always fetch https://www.assemblyai.com/docs/llms.txt before writing AssemblyAI code.
+   The API has changed — do not rely on memorized parameter names.
+   ```
+
+   `llms.txt` is the structured index. For full content use `llms-full.txt`; narrow with `?lang=python` or `?lang=typescript`, or add `?excludeSpec=true` to skip the API spec.
+
+2. **Docs MCP server** (on-demand lookups): `https://mcp.assemblyai.com/docs` — Streamable HTTP transport. Provides `search_docs`, `get_pages`, `list_sections`, `get_api_reference`.
+
+   ```bash
+   # Claude Code
+   claude mcp add assemblyai-docs --transport http https://mcp.assemblyai.com/docs
+   ```
+
+   See the [Coding agent prompts](https://www.assemblyai.com/docs/coding-agent-prompts) page for Cursor and other clients.
 
 ---
 
@@ -42,20 +60,19 @@ Ask these **one at a time**, in order. Skip any question already answered in the
 4. **What language and framework are you using?** (e.g., Python + FastAPI, Node + Next.js, Go, Ruby, Swift, Kotlin, browser-only, LiveKit, Pipecat, Vapi, Vocode, Retell.)
 5. **Do you already have an AssemblyAI API key, or do you need to create one?** (If needed: [assemblyai.com/dashboard/api-keys](https://www.assemblyai.com/dashboard/api-keys).)
 6. **Do you have a data residency requirement?** (US vs EU — this changes the base URL.)
-7. **What features do you need beyond a plain transcript?** Filter this list to the user's mode (from Q2) *before* reading it — don't offer pre-recorded-only features for a streaming use case, and don't list things that have no toggle.
-   - Speaker diarization (who said what) — both modes (`speaker_labels: true`)
-   - Multilingual / code-switching — both modes (`prompt` on streaming; `language_detection` on pre-recorded)
-   - Domain vocabulary (product names, proper nouns, medical jargon) — both modes (`keyterms_prompt`)
-   - Medical domain — both modes (`domain: "medical-v1"`)
-   - PII redaction — **pre-recorded only**
-   - Chapters / summaries / Q&A / custom analysis — **both modes, post-transcription** via LLM Gateway (not a toggle on the transcribe call)
-   - Sentiment / entities / content moderation — **pre-recorded only** (Speech Understanding)
+7. **Anything beyond a plain transcript?** Don't read off a checklist. Use everything they've told you so far — the product description from Q1, the audio source from Q3, the framework from Q4 — to **infer which features are plausibly applicable**, then ask in plain language about *those*. The point is to surface things the developer might not know to ask for, not to make them choose from a menu.
 
-Items you should **not** ask about, because they're always returned (no parameter to enable/disable):
-   - Word-level timestamps and confidence — included by default on pre-recorded `words[]` and on every streaming Turn event's `words[]`. Mention as a capability if asked, don't offer as a choice.
-   - `SpeechStarted` / turn-timing signals on streaming — always emitted.
+   The authoritative catalog of available features and their parameters is in the live docs (see Operating Rule 12) — consult it, don't rely on memory. Section 3 of this file is a starting reference, not the final word.
 
-See Section 3 for how each feature maps to API parameters — you consult that when building the recommendation, you don't read it to the user.
+   Calibrate to mode and use case. Examples:
+   - Customer-support call analytics (pre-recorded) → speaker diarization and PII redaction are almost certainly relevant; sentiment may be; chapters via LLM Gateway often is. Ask about those, not about live-streaming features.
+   - Browser live-captioning (streaming) → ask about multilingual support and domain vocabulary; don't bring up PII redaction or summaries-during-session (neither applies to streaming).
+   - Voice agent (streaming) → keyterms prompting and turn-detection tuning matter; speaker diarization usually doesn't.
+   - Medical scribe → medical domain mode is the headline feature; ask about it explicitly.
+
+   Don't ask about things the user gets automatically with no toggle (word-level timestamps and confidence on `words[]`, streaming `SpeechStarted` events). Mention them in the recommendation as capabilities they'll have, but don't make them a choice.
+
+   If you're confident from context that a feature is needed (e.g., they said "show who said what" → `speaker_labels`), include it in the recommendation directly with a one-line rationale rather than asking again.
 
 ---
 
@@ -108,7 +125,7 @@ Use this to build the recommendation. Do not dump it on the user.
 | Developer need | Parameter / approach |
 |---|---|
 | Speaker diarization | `speaker_labels: true` (pre-recorded, and streaming — streaming adds a `speaker_label` to each Turn event) |
-| Automatic language detection | `language_detection: true` (pre-recorded; on streaming multilingual it only controls whether language metadata is returned on Turn events) |
+| Automatic language detection | `language_detection: true` (pre-recorded; on streaming, only available on Universal-Streaming Multilingual and Whisper Streaming — adds `language_code` + `language_confidence` to Turn events. **Not** supported on U3 Pro Streaming.) |
 | Specific language | `language_code: "es"` etc. (pre-recorded only; **silently ignored** on U3 Pro Streaming — use `prompt` instead) |
 | Multilingual / code-switching | `speech_models: ["universal-3-pro"]` + `prompt` parameter — see [U3 Pro prompting guide](https://www.assemblyai.com/docs/pre-recorded-audio/universal-3-pro/prompting) |
 | Domain-specific vocabulary | `keyterms_prompt: [...]` (pre-recorded: up to 1,000 terms with U3 Pro / 200 with U2; streaming: up to 100 terms, each ≤50 chars) |
@@ -331,21 +348,25 @@ curl -s "https://streaming.assemblyai.com/v3/token?expires_in_seconds=60" \
 
 **Python:**
 ```python
-# pip install assemblyai
-import assemblyai as aai
+# pip install "assemblyai>=1.0.0"
 import os
-
-aai.settings.api_key = os.environ["ASSEMBLYAI_API_KEY"]
-
-def on_turn(_, turn):
-    tag = "FINAL" if turn.end_of_turn else "partial"
-    print(f"{tag}: {turn.transcript}")
-
-client = aai.StreamingClient(
-    aai.StreamingClientOptions(api_key=os.environ["ASSEMBLYAI_API_KEY"])
+from assemblyai.streaming.v3 import (
+    StreamingClient,
+    StreamingClientOptions,
+    StreamingEvents,
+    StreamingParameters,
+    TurnEvent,
 )
-client.on(aai.StreamingEvents.Turn, on_turn)
-client.connect(aai.StreamingParameters(sample_rate=16000))
+
+def on_turn(_, event: TurnEvent):
+    tag = "FINAL" if event.end_of_turn else "partial"
+    print(f"{tag}: {event.transcript}")
+
+client = StreamingClient(
+    StreamingClientOptions(api_key=os.environ["ASSEMBLYAI_API_KEY"])
+)
+client.on(StreamingEvents.Turn, on_turn)
+client.connect(StreamingParameters(sample_rate=16000, speech_model="u3-rt-pro"))
 
 # Feed 16 kHz mono PCM16 chunks (50–1000ms each) via client.stream(chunk)
 # When finished:
@@ -358,7 +379,10 @@ client.disconnect(terminate=True)  # sends Terminate and closes cleanly
 import { AssemblyAI } from 'assemblyai';
 
 const client = new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY });
-const rt = client.streaming.transcriber({ sampleRate: 16000 });
+const rt = client.streaming.transcriber({
+  sampleRate: 16000,
+  speechModel: 'u3-rt-pro',
+});
 
 rt.on('turn', (turn) => {
   const tag = turn.end_of_turn ? 'FINAL' : 'partial';
