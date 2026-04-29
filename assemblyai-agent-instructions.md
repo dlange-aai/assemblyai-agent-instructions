@@ -41,7 +41,7 @@ This is a public API. The developer creates their own key at [assemblyai.com/das
 11. **Be flexible.** If something the developer says doesn't match the shape of the API (e.g., they describe a use case that isn't supported — see Section 13), say so directly and propose the closest supported alternative.
 12. **Verify parameters against live docs before recommending.** This file is a snapshot — features move between beta and GA, model-specific behaviors change, and new knobs ship regularly. Before posting the Section 2 recommendation, confirm each parameter you plan to use is supported for the chosen **mode** (pre-recorded vs streaming) *and* **model** (U3 Pro, U2, U3 Pro Streaming, Universal-Streaming, Whisper-Streaming). Do not assume a pre-recorded flag works on streaming, or that a parameter supported on U2 still behaves the same on U3 Pro. Pull the current reference rather than memorizing. Primary sources, in order of preference:
     - `https://www.assemblyai.com/docs/llms-full.txt` — the canonical machine-readable reference
-    - Per-mode docs: `/docs/async-stt/*` (pre-recorded) and `/docs/streaming-stt/*` (streaming), including the model-specific overview page (e.g., `/docs/streaming-stt/universal-3-pro/overview`) which lists *exactly* which parameters are honored/ignored by that model
+    - Per-mode docs: `/docs/pre-recorded-audio/*` (pre-recorded) and `/docs/streaming/*` (streaming), including the model-specific overview page (e.g., `/docs/streaming/universal-3-pro` and `/docs/streaming/select-the-speech-model`) which lists *exactly* which parameters are honored/ignored by that model
     - The OpenAPI-backed API reference at `/docs/api-reference/*` for request/response schemas
     - For LLM Gateway: `/docs/llm-gateway/overview` lists the current valid `model` strings — don't guess short names like `claude-sonnet-4`
   If a flag you remembered isn't in the current docs (or is marked beta / deprecated / ignored for the chosen model), flag it in the recommendation's "Open questions / assumptions" block and ask the developer before proceeding.
@@ -284,7 +284,7 @@ Optional custom auth on your webhook: set `webhook_auth_header_name` and `webhoo
 
 ## 8. LLM Gateway (chapters, summaries, custom analysis)
 
-The deprecated params `auto_chapters`, `summarization`, `summary_model`, `summary_type` have been replaced by LLM Gateway. Workflow:
+LLM Gateway replaces both the deprecated transcript params (`auto_chapters`, `summarization`, `summary_model`, `summary_type`) and the legacy **LeMUR** API, which sunset on 2026-03-31. If a developer mentions LeMUR or `transcript_ids`, point them at LLM Gateway and the [migration guide](https://www.assemblyai.com/docs/llm-gateway/migration-from-lemur). Workflow:
 
 1. Transcribe normally with `POST /v2/transcript`.
 2. Once `status == "completed"`, POST to LLM Gateway with the transcript text (or paragraphs from `GET /v2/transcript/{id}/paragraphs` for chapter-style output):
@@ -463,7 +463,7 @@ async def run(audio_source):
 
 Use this when the developer wants a complete spoken AI agent — not just transcription. Single WebSocket, audio in and audio out, with STT + LLM + TTS + turn detection + tool calling all managed by AssemblyAI.
 
-**Endpoint:** `wss://agents.assemblyai.com/v1/voice`
+**Endpoint:** `wss://agents.assemblyai.com/v1/ws`
 
 **Auth:** `Authorization: Bearer YOUR_API_KEY` — the Bearer prefix is **required** on this product (different from STT and LLM Gateway, which take the raw key). For browsers/mobile, mint a temp token instead and pass it as `?token=<token>`.
 
@@ -488,11 +488,25 @@ curl -s "https://agents.assemblyai.com/v1/token?expires_in_seconds=300&max_sessi
      "session": {
        "system_prompt": "You are a helpful assistant.",
        "greeting": "Hi there! How can I help?",
-       "output": { "voice": "claire" },
-       "tools": [ /* function-calling tool defs, if any */ ]
+       "input": {
+         "format": { "encoding": "audio/pcm" },
+         "keyterms": ["AssemblyAI", "Universal-3"],
+         "turn_detection": {
+           "vad_threshold": 0.5,
+           "min_silence": 200,
+           "max_silence": 1000,
+           "interrupt_response": true
+         }
+       },
+       "output": {
+         "voice": "claire",
+         "format": { "encoding": "audio/pcm" }
+       },
+       "tools": [ /* flat-schema tool defs, see step 5 */ ]
      }
    }
    ```
+   Output `encoding` accepts `audio/pcm` (24 kHz, default), `audio/pcmu` (G.711 μ-law, 8 kHz), or `audio/pcma` (G.711 A-law, 8 kHz) — use the G.711 variants for telephony bridges (Twilio, etc.) so you don't have to resample.
 2. Server replies with `session.ready` (capture `session_id` for `session.resume` if you reconnect within 30 s of a disconnect).
 3. **Only after `session.ready`**, start streaming mic audio:
    ```json
@@ -502,7 +516,21 @@ curl -s "https://agents.assemblyai.com/v1/token?expires_in_seconds=300&max_sessi
    - `input.speech.started` / `input.speech.stopped` (VAD)
    - `transcript.user.delta` (partials) and `transcript.user` (final)
    - `reply.started`, `reply.audio` (multiple base64 PCM16 chunks — write directly into an output buffer at 24 kHz), `transcript.agent`, `reply.done`
-5. **Tool calls:** server sends `tool.call`. Accumulate the result locally, then send `tool.result` with the matching `call_id` *after* `reply.done` fires. If `reply.done.status == "interrupted"` (user barge-in), discard pending tool results.
+   - **Field-name asymmetry:** `input.audio` carries audio in the `audio` field; `reply.audio` carries it in the `data` field. Easy to miss — copying `event["audio"]` from input handling will silently return nothing on output.
+5. **Tool calls:** tool definitions in `session.tools` use a **flat** schema — *not* OpenAI's nested `{type: "function", function: {...}}` form:
+   ```json
+   {
+     "type": "function",
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "parameters": {
+       "type": "object",
+       "properties": { "location": { "type": "string" } },
+       "required": ["location"]
+     }
+   }
+   ```
+   Server sends `tool.call` with `{call_id, name, arguments}`. Accumulate the result locally, then send `tool.result` with the matching `call_id` *after* `reply.done` fires. If `reply.done.status == "interrupted"` (user barge-in), discard pending tool results.
 6. **Resume after disconnect:** within 30 s, reconnect with a *new* token and send `session.resume` carrying the previous `session_id` to keep conversation context. After 30 s, start a new session.
 
 ### Playback gotcha
@@ -519,7 +547,7 @@ import asyncio, base64, json, os
 import sounddevice as sd
 import websockets
 
-URL = "wss://agents.assemblyai.com/v1/voice"
+URL = "wss://agents.assemblyai.com/v1/ws"
 SAMPLE_RATE = 24_000
 
 async def main():
@@ -727,3 +755,5 @@ If a developer asks for any of these, say so directly and propose the closest su
 - LLM Gateway model IDs are exact and versioned (e.g., `claude-sonnet-4-6`, `gpt-5.2`, `gemini-2.5-pro`). Shorthand like `claude-sonnet-4` is invalid.
 - Phone audio stays at native 8 kHz mu-law (`encoding=pcm_mulaw`) — don't upsample.
 - EU customers use `api.eu.assemblyai.com`, `streaming.eu.assemblyai.com`, and `llm-gateway.eu.assemblyai.com`. The default streaming host (`streaming.assemblyai.com`) is **Edge Routing**, not US-pinned — use `streaming.us.assemblyai.com` if you need data residency guarantees on the US side.
+- Speech-model values are **raw strings** in the SDKs (`"universal-3-pro"`, `"universal-2"`, `"u3-rt-pro"`). Enum aliases like `aai.SpeechModel.universal_3_pro` do **not** exist — agents that hallucinate them produce code that imports cleanly and fails at runtime.
+- LeMUR has fully sunset (2026-03-31). Don't generate code that calls LeMUR endpoints or passes `transcript_ids` to a chat-completions API — use LLM Gateway with the transcript text in `messages` instead.
